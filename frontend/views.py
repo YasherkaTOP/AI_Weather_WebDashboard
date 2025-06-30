@@ -626,12 +626,30 @@ class StationPage:
                     ft.SnackBar(content=ft.Text(value='Период не может быть больше 168 часов (неделя)'), bgcolor=ft.Colors.ORANGE))
             else:
                 self.close_overlay(None)
-                try:
-                    self.app_manager.is_requesting = True
-                    async with ClientSession() as session:
+                async with ClientSession() as session:
+                    try:
+                        self.app_manager.is_requesting = True
                         await session.post(
                             ADD_RULE_URL + f'?station_id={self.station.id}&rule_option={self.rule_option.value}&rule_value={self.rule_sign.value}{self.rule_value.value}&rule_period={self.rule_period.value}'
                         )
+                    except Exception as e:
+                        self.page.open(
+                            ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
+                        print(f"Error: {e}")
+                    finally:
+                        await session.close()
+                        self.app_manager.is_requesting = False
+
+    async def delete_rule(self, rule_id):
+        if self.app_manager.is_requesting:
+            pass
+        else:
+            async with ClientSession() as session:
+                try:
+                    self.app_manager.is_requesting = True
+                    await session.post(
+                        DELETE_RULE_URL + f'?station_id={self.station.id}&rule_id={rule_id}'
+                    )
                 except Exception as e:
                     self.page.open(
                         ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
@@ -640,77 +658,59 @@ class StationPage:
                     await session.close()
                     self.app_manager.is_requesting = False
 
-    async def delete_rule(self, rule_id):
-        if self.app_manager.is_requesting:
-            pass
-        else:
-            try:
-                self.app_manager.is_requesting = True
-                async with ClientSession() as session:
-                    await session.post(
-                        DELETE_RULE_URL + f'?station_id={self.station.id}&rule_id={rule_id}'
-                    )
-            except Exception as e:
-                self.page.open(
-                    ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
-                print(f"Error: {e}")
-            finally:
-                await session.close()
-                self.app_manager.is_requesting = False
-
     async def toggle_station(self, e):
         if self.app_manager.is_requesting:
             pass
         else:
-            try:
-                self.app_manager.is_requesting = True
-                async with ClientSession() as session:
+            async with ClientSession() as session:
+                try:
+                    self.app_manager.is_requesting = True
                     await session.post(
                         TOGGLE_URL + f'?station_id={self.station.id}'
                     )
-            except Exception as e:
-                self.page.open(
-                    ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
-                print(f"Error: {e}")
-            finally:
-                await session.close()
-                self.app_manager.is_requesting = False
+                except Exception as e:
+                    self.page.open(
+                        ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
+                    print(f"Error: {e}")
+                finally:
+                    await session.close()
+                    self.app_manager.is_requesting = False
 
     async def station_delete(self, e):
         if self.app_manager.is_requesting:
             pass
         else:
-            try:
-                self.app_manager.is_requesting = True
-                async with ClientSession() as session:
+            async with ClientSession() as session:
+                try:
+                    self.app_manager.is_requesting = True
                     await session.post(
                         DELETE_URL + f'?station_id={self.station.id}'
                     )
-            except Exception as e:
-                self.page.open(
-                    ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
-                print(f"Error: {e}")
-            finally:
-                await session.close()
-                self.app_manager.is_requesting = False
+                except Exception as e:
+                    self.page.open(
+                        ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
+                    print(f"Error: {e}")
+                finally:
+                    await session.close()
+                    self.app_manager.is_requesting = False
 
     async def station_reload(self, e):
         if self.app_manager.is_requesting:
             pass
         else:
-            try:
-                self.app_manager.is_requesting = True
-                async with ClientSession() as session:
+            async with ClientSession() as session:
+                try:
+                    self.app_manager.is_requesting = True
                     await session.post(
                         RELOAD_URL + f'?station_id={self.station.id}'
                     )
-            except Exception as e:
-                self.page.open(
-                    ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
-                print(f"Error: {e}")
-            finally:
-                await session.close()
-                self.app_manager.is_requesting = False
+                except Exception as e:
+                    self.page.open(
+                        ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
+                    print(f"Error: {e}")
+                finally:
+                    await session.close()
+                    self.app_manager.is_requesting = False
 
     async def edit_station(self, e):
         self.station_newname = ft.TextField(hint_text='Новое название')
@@ -746,19 +746,19 @@ class StationPage:
             pass
         else:
             self.close_overlay(None)
-            try:
-                self.app_manager.is_requesting = True
-                async with ClientSession() as session:
+            async with ClientSession() as session:
+                try:
+                    self.app_manager.is_requesting = True
                     await session.post(
                         EDIT_STATION_URL + f'?station_id={self.station.id}&name={self.station_newname.value}&descr={self.station_newdesc.value}'
                     )
-            except Exception as e:
-                self.page.open(
-                    ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
-                print(f"Error: {e}")
-            finally:
-                await session.close()
-                self.app_manager.is_requesting = False
+                except Exception as e:
+                    self.page.open(
+                        ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
+                    print(f"Error: {e}")
+                finally:
+                    await session.close()
+                    self.app_manager.is_requesting = False
 
 
 class MainPage:
@@ -980,7 +980,7 @@ class MainPage:
             icon = ft.Icons.ERROR
             icon_color = ft.Colors.RED
 
-        if station.alerts:
+        if station.alerts and station.status == 'В норме':
             if is_marker:
                 status_icon = ft.Text(value='🚨', color=ft.Colors.BLACK,
                                       text_align=ft.TextAlign.CENTER, width=40, height=40, size=15)
@@ -1111,19 +1111,19 @@ class MainPage:
         if self.app_manager.is_requesting:
             pass
         else:
-            try:
-                self.app_manager.is_requesting = True
-                async with ClientSession() as session:
+            async with ClientSession() as session:
+                try:
+                    self.app_manager.is_requesting = True
                     await session.post(
                         ADD_STATION_URL + f'?name={name}&descr={descr}&lat={lat}&lng={lng}&activate={activate}'
                     )
-            except Exception as e:
-                self.page.open(
-                    ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
-                print(f"Error: {e}")
-            finally:
-                await session.close()
-                self.app_manager.is_requesting = False
+                except Exception as e:
+                    self.page.open(
+                        ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
+                    print(f"Error: {e}")
+                finally:
+                    await session.close()
+                    self.app_manager.is_requesting = False
 
     def close_overlay(self, e):
         self.page.overlay.clear()
