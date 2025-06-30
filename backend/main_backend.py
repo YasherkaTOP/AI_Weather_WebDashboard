@@ -1,32 +1,34 @@
-import multiprocessing
 import os
-import pickle
-import time
 
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Table, ForeignKey, select, delete, BOOLEAN
-from sqlalchemy.orm import sessionmaker, relationship, declarative_base
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, select, delete, \
+    BOOLEAN
+from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-import requests
-import torch
-import torch.nn as nn
 import datetime
-from apscheduler.schedulers.background import BackgroundScheduler
 import asyncio
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-import queue
-import random
-import uuid
-from typing import List, Dict, Tuple, Optional
-from pytorch_forecasting import TemporalFusionTransformer
-from config import DATASET_PATH, MODEL_PATH
-from fastapi.middleware.cors import CORSMiddleware
+from typing import List, Optional
 
-q = queue.Queue()
+# Инициализация приложения
+app = FastAPI()
+
+# Конфигурация БД
+if os.path.exists('database.db'):
+    os.remove('database.db')
+DATABASE_URL = "sqlite+aiosqlite:///./database.db"
+engine = create_async_engine(DATABASE_URL)
+SessionLocal = sessionmaker(
+    engine, class_=AsyncSession, expire_on_commit=False
+)
+Base = declarative_base()
+
+# Очередь задач
+task_queue = asyncio.Queue()
 
 
+# Модель данных
 class Stationn(BaseModel):
     id: int
     name: str
@@ -43,27 +45,13 @@ class Stationn(BaseModel):
     alerts: Optional[list[str]]
 
 
-# Инициализация приложения
-app = FastAPI()
-
-# Конфигурация БД
-if os.path.exists('database.db'):
-    os.remove('database.db')
-DATABASE_URL = "sqlite+aiosqlite:///./database.db"
-engine = create_async_engine(DATABASE_URL)
-SessionLocal = sessionmaker(
-    engine, class_=AsyncSession, expire_on_commit=False
-)
-Base = declarative_base()
-
-
 # Модель БД
 class Station(Base):
     __tablename__ = "stations"
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String)
     description = Column(String)
-    status = Column(String, index=True)
+    status = Column(String)
     lat = Column(Float)
     lng = Column(Float)
     created_at = Column(DateTime, default=datetime.datetime.now)
@@ -86,6 +74,9 @@ class Temperature(Base):
     value = Column(Float)
     time = Column(DateTime)
     station_id = Column(Integer, ForeignKey('stations.id', ondelete='CASCADE'))
+
+
+active_connections: List[WebSocket] = []
 
 
 async def init_db():
@@ -158,46 +149,52 @@ async def init_db():
                 await session.commit()
 
 
-active_connections: List[WebSocket] = []
-
-
 async def get_station_object(station):
     async with SessionLocal() as session:
         async with session.begin():
+            # Получаем температуры
             temp_query = await session.execute(
                 select(Temperature)
                 .where(Temperature.station_id == station.id)
-                .order_by(Temperature.time.asc()).with_for_update(skip_locked=True)
+                .order_by(Temperature.time.asc())
             )
-            query_result = temp_query.scalars().all()
+            temps = temp_query.scalars().all()
+
+            # Формируем данные
             dates = None
             last_temp = None
             predictions = None
-            if [temp.id for temp in query_result]:
-                temps = [temp.value for temp in query_result]
-                dates = [temp.time.strftime("%Y-%m-%d %H:%M:%S") for temp in query_result][:-1]
-                last_temp = temps[-1]
-                predictions = temps[:-1]
 
+            if temps:
+                temps_list = [t.value for t in temps]
+                times_list = [t.time.strftime("%Y-%m-%d %H:%M:%S") for t in temps]
+
+                last_temp = temps_list[-1] if temps_list else None
+                if len(temps_list) > 1:
+                    predictions = temps_list[:-1]
+                    dates = times_list[:-1]
+
+            # Получаем правила
             rules_query = await session.execute(
                 select(Rule).where(Rule.station_id == station.id)
             )
             rules = rules_query.scalars().all()
             rules_list = [
-                (rule.id, f'Температура {rule.rule_option} {rule.rule_value} через {rule.rule_period} часа/часов') for
-                rule in rules]
-            rules_list = rules_list if rules_list else None
+                (rule.id, f'Температура {rule.rule_option} {rule.rule_value} через {rule.rule_period} часа/часов')
+                for rule in rules
+            ] if rules else None
 
+            # Формируем алерты
             alerts_list = []
             if rules:
                 for rule in rules:
                     if rule.active:
-                        alerts_list.append(f'Температура {rule.rule_option} {rule.rule_value} через {rule.rule_period} часа/часов')
+                        alerts_list.append(
+                            f'Температура {rule.rule_option} {rule.rule_value} через {rule.rule_period} часа/часов'
+                        )
             alerts_list = alerts_list if alerts_list else None
-            await session.commit()
 
-            # Создаем экземпляр dataclass
-            station_data = Stationn(
+            return Stationn(
                 id=station.id,
                 name=station.name,
                 description=station.description,
@@ -206,18 +203,37 @@ async def get_station_object(station):
                 status=station.status,
                 lat=station.lat,
                 lng=station.lng,
-                last_temp=last_temp,
-                predictions=predictions,
-                preds_datetime=dates,
-                rules=rules_list,
-                alerts=alerts_list
+                last_temp=last_temp if station.status == 'В норме' else None,
+                predictions=predictions if station.status == 'В норме' else None,
+                preds_datetime=dates if station.status == 'В норме' else None,
+                rules=rules_list if station.status in ['В норме', 'Выключено'] else None,
+                alerts=alerts_list if station.status == 'В норме' else None
             ).model_dump(mode='json')
-            return station_data
 
 
 @app.on_event("startup")
 async def startup():
     await init_db()
+
+    # Загрузка прерванных обновляемых станций в очередь
+    async with SessionLocal() as session:
+        stations = await session.execute(
+            select(Station).where(Station.status == 'Обновление')
+        )
+        for station in stations.scalars().all():
+            await task_queue.put(station.id)
+
+    # Проверка устаревших станций
+    async with SessionLocal() as session:
+        stations = await session.execute(
+            select(Station).where(
+                Station.updated_at < datetime.datetime.now().replace(minute=0, second=0, microsecond=0))
+        )
+        for station in stations.scalars().all():
+            if station.status == 'В норме':
+                station.status = 'Обновление'
+                await task_queue.put(station.id)
+                await session.commit()
 
 
 # WebSocket эндпоинт
@@ -234,15 +250,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # Эндпоинт для получения данных станций
 @app.get("/stations")
-async def get_stations() -> dict[str, dict[int, dict]]:
+async def get_stations():
     async with SessionLocal() as session:
-        # Получаем все станции
         stations = await session.execute(select(Station))
-        stations = stations.scalars().all()
-        result = {}
-        for station in stations:
-            result[station.id] = await get_station_object(station)
-        return {"stations": result}
+        return {"stations": {s.id: await get_station_object(s) for s in stations.scalars().all()}}
 
 
 @app.post("/delete_station")
@@ -250,7 +261,7 @@ async def delete_station(station_id: int) -> dict[str, str]:
     async with SessionLocal() as session:
         async with session.begin():
             stations = await session.execute(
-                select(Station).where(Station.id == station_id).with_for_update(skip_locked=True))
+                select(Station).where(Station.id == station_id).with_for_update())
             result = stations.scalar_one_or_none()
             if not result:
                 await session.rollback()
@@ -262,7 +273,7 @@ async def delete_station(station_id: int) -> dict[str, str]:
                 for conn in active_connections:
                     await conn.send_json(message)
                 return {"status": "error"}
-            if not result.status == 'Выключено':
+            if result.status != 'Выключено':
                 await session.rollback()
                 message = {
                     "action": "update",
@@ -286,126 +297,90 @@ async def delete_station(station_id: int) -> dict[str, str]:
             return {"status": "success"}
 
 
-# # @app.post("/reload_station")
-# # async def reload_station(station_id: int) -> dict[str, str]:
-# #     if station_id not in stations_db:
-# #         raise HTTPException(
-# #             status_code=404,
-# #             detail=f"Station {station_id} not found"
-# #         )
-# #     if stations_db[station_id].status == 'Ошибка':
-# #         message = {
-# #             "action": "update",
-# #             "station_id": station_id,
-# #             'values': Station(
-# #                 id=station_id,
-# #                 name="Normal NoAlerts Station",
-# #                 description="Normal NoAlerts meteorological station",
-# #                 created_at=datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-# #                 updated_at=datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-# #                 status='В норме',
-# #                 lat=round(np.random.uniform(-80, 80), 3),
-# #                 lng=round(np.random.uniform(-150, 150), 3),
-# #                 last_temp=10.534,
-# #                 predictions=[round(i, 4) for i in np.random.uniform(low=-30.0, high=30.0, size=672)],
-# #                 preds_datetime=[(datetime(2025, 6, 1, hour=5) + timedelta(hours=i)).strftime("%Y-%m-%dT%H:%M:%S") for i
-# #                                 in
-# #                                 range(672)],
-# #                 rules=[(i, f'Темпеарутра выше {i}') for i in range(10)],
-# #                 alerts=None
-# #             ).model_dump(mode='json'),
-# #             "snack": f"Станция успешно перезагружена"
-# #         }
-# #         for conn in active_connections:
-# #             await conn.send_json(message)
-# #
-# #         return {"status": "success"}
-# #     else:
-# #         message = {
-# #             "action": "update",
-# #             "station_id": station_id,
-# #             'values': stations_db[station_id].model_dump(mode='json'),
-# #             "snack": f"Ошибка: Невозможно перезагрузить станцию"
-# #         }
-# #         for conn in active_connections:
-# #             await conn.send_json(message)
-# #
-# #         return {"status": "error"}
-# #
-# #
-# # @app.post("/toggle_station")
-# # async def toggle_station(station_id: int) -> dict[str, str]:
-# #     if station_id not in stations_db:
-# #         raise HTTPException(
-# #             status_code=404,
-# #             detail=f"Station {station_id} not found"
-# #         )
-# #     if stations_db[station_id].status == 'Выключено':
-# #         stations_db[station_id] = Station(
-# #             id=station_id,
-# #             name="Normal NoAlerts Station",
-# #             description="Normal NoAlerts meteorological station",
-# #             created_at=datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-# #             updated_at=datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-# #             status='В норме',
-# #             lat=stations_db[station_id].lat,
-# #             lng=stations_db[station_id].lng,
-# #             last_temp=10.534,
-# #             predictions=[round(i, 4) for i in np.random.uniform(low=-30.0, high=30.0, size=672)],
-# #             preds_datetime=[(datetime(2025, 6, 1, hour=5) + timedelta(hours=i)).strftime("%Y-%m-%dT%H:%M:%S") for i
-# #                             in
-# #                             range(672)],
-# #             rules=[(i, f'Темпеарутра выше {i}') for i in range(10)],
-# #             alerts=None
-# #         )
-# #         message = {
-# #             "action": "update",
-# #             "station_id": station_id,
-# #             'values': stations_db[station_id].model_dump(mode='json'),
-# #             "snack": f"Станция успешно включена"
-# #         }
-# #         for conn in active_connections:
-# #             await conn.send_json(message)
-# #
-# #         return {"status": "success"}
-# #     elif stations_db[station_id].status == 'В норме' or stations_db[station_id].status == 'Ошибка':
-# #
-# #         stations_db[station_id] = Station(
-# #             id=station_id,
-# #             name="Off Old Station",
-# #             description="Off Old meteorological station",
-# #             created_at=datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-# #             updated_at=datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-# #             status='Выключено',
-# #             lat=stations_db[station_id].lat,
-# #             lng=stations_db[station_id].lng,
-# #             last_temp=10.534,
-# #             predictions=None,
-# #             preds_datetime=None,
-# #             rules=[(i, f'Темпеарутра выше {i}') for i in range(13)],
-# #             alerts=None
-# #         )
-# #         message = {
-# #             "action": "update",
-# #             "station_id": station_id,
-# #             'values': stations_db[station_id].model_dump(mode='json'),
-# #             "snack": f"Станция успешно выключена"
-# #         }
-# #         for conn in active_connections:
-# #             await conn.send_json(message)
-# #
-# #         return {"status": "success"}
-# #     else:
-# #         message = {
-# #             "action": "update",
-# #             "station_id": station_id,
-# #             'values': stations_db[station_id].model_dump(mode='json'),
-# #             "snack": f"Ошибка: Невозможно включить/выключить станцию"
-# #         }
-# #         for conn in active_connections:
-# #             await conn.send_json(message)
-# #
-# #         return {"status": "error"}
+@app.post("/reload_station")
+async def reload_station(station_id: int) -> dict[str, str]:
+    async with SessionLocal() as session:
+        async with session.begin():
+            stations = await session.execute(
+                select(Station).where(Station.id == station_id).with_for_update())
+            result = stations.scalar_one_or_none()
+            if not result:
+                await session.rollback()
+                message = {
+                    "action": "delete",
+                    "station_id": station_id,
+                    "snack": f"Ошибка: Станции не существует"
+                }
+                for conn in active_connections:
+                    await conn.send_json(message)
+                return {"status": "error"}
+            if not result.status == 'Ошибка':
+                await session.rollback()
+                message = {
+                    "action": "update",
+                    "station_id": station_id,
+                    "values": await get_station_object(result),
+                    "snack": f"Ошибка: Станция не может быть перезагружена"
+                }
+                for conn in active_connections:
+                    await conn.send_json(message)
+                return {"status": "error"}
+            result.status = 'Обновление'
+            await session.commit()
+            await task_queue.put(station_id)
+            message = {
+                "action": "update",
+                "station_id": station_id,
+                "values": await get_station_object(result),
+                "snack": f"Ошибка: Станция не может быть перезагружена"
+            }
+            for conn in active_connections:
+                await conn.send_json(message)
+            return {"status": "success"}
+
+
+@app.post("/toggle_station")
+async def toggle_station(station_id: int) -> dict[str, str]:
+    async with SessionLocal() as session:
+        async with session.begin():
+            stations = await session.execute(
+                select(Station).where(Station.id == station_id).with_for_update())
+            result = stations.scalar_one_or_none()
+            if not result:
+                await session.rollback()
+                message = {
+                    "action": "delete",
+                    "station_id": station_id,
+                    "snack": f"Ошибка: Станции не существует"
+                }
+                for conn in active_connections:
+                    await conn.send_json(message)
+                return {"status": "error"}
+            if result.status == 'Ошибка' or result.status == 'В норме':
+                result.status = 'Выключено'
+                await session.commit()
+                message = {
+                    "action": "update",
+                    "station_id": station_id,
+                    "values": await get_station_object(result),
+                    "snack": f"Станция успешно выключена"
+                }
+                for conn in active_connections:
+                    await conn.send_json(message)
+                return {"status": "success"}
+            if result.status == 'Выключено':
+                result.status = 'Обновление'
+                await task_queue.put(station_id)
+                await session.commit()
+                message = {
+                    "action": "update",
+                    "station_id": station_id,
+                    "values": await get_station_object(result),
+                    "snack": f"Станция успешно выключена"
+                }
+                for conn in active_connections:
+                    await conn.send_json(message)
+                return {"status": "success"}
 
 
 @app.post("/edit_station")
@@ -413,7 +388,7 @@ async def edit_station(station_id: int, name: str, descr: str) -> dict[str, str]
     async with SessionLocal() as session:
         async with session.begin():
             stations = await session.execute(
-                select(Station).where(Station.id == station_id).with_for_update(skip_locked=True))
+                select(Station).where(Station.id == station_id).with_for_update())
             result = stations.scalar_one_or_none()
             if not result:
                 await session.rollback()
@@ -441,86 +416,97 @@ async def edit_station(station_id: int, name: str, descr: str) -> dict[str, str]
             return {"status": "success"}
 
 
-# # @app.post("/add_rule")
-# # async def add_rule(station_id: int, rule_option: str, rule_value: str, rule_period: int) -> dict[str, str]:
-# #     if station_id not in stations_db:
-# #         raise HTTPException(
-# #             status_code=404,
-# #             detail=f"Station {station_id} not found"
-# #         )
-# #     new_id = len(stations_db[station_id].rules)
-# #     ДОБАВИТЬ ПРЕОБРАЗОВАНИЕ value в число
-# #     stations_db[station_id].rules.append(
-# #         (new_id, f'Температура {rule_option} {rule_value} через {rule_period} часа/часов'))
-# #
-# #     message = {
-# #         "action": "update",
-# #         "station_id": station_id,
-# #         'values': stations_db[station_id].model_dump(mode='json'),
-# #         "snack": f"Успешно добавлено правило"
-# #     }
-# #     for conn in active_connections:
-# #         await conn.send_json(message)
-# #
-# #     return {"status": "success"}
-# #
-# #
-# # @app.post("/add_station")
-# # async def add_station(name: str, descr: str, lat: float, lng: float, activate: bool) -> dict[str, str]:
-# #     new_key = max(stations_db.keys()) + 1
-# #     if activate:
-# #         stations_db[new_key] = Station(
-# #             id=new_key,
-# #             name=name,
-# #             description=descr,
-# #             created_at=datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-# #             updated_at=None,
-# #             status='В норме',
-# #             lat=lat,
-# #             lng=lng,
-# #             last_temp=10.534,
-# #             predictions=[round(i, 4) for i in np.random.uniform(low=-30.0, high=30.0, size=672)],
-# #             preds_datetime=[(datetime(2025, 6, 1, hour=5) + timedelta(hours=i)).strftime("%Y-%m-%dT%H:%M:%S") for i
-# #                             in
-# #                             range(672)],
-# #             rules=[(i, f'Темпеарутра выше {i}') for i in range(10)],
-# #             alerts=None
-# #         )
-# #     else:
-# #         stations_db[new_key] = Station(
-# #             id=new_key,
-# #             name=name,
-# #             description=descr,
-# #             created_at=datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-# #             updated_at=None,
-# #             status='Выключено',
-# #             lat=lat,
-# #             lng=lng,
-# #             last_temp=None,
-# #             predictions=None,
-# #             preds_datetime=None,
-# #             rules=[(i, f'Темпеарутра выше {i}') for i in range(10)],
-# #             alerts=None
-# #         )
-# #
-# #     message = {
-# #         "action": "update",
-# #         "station_id": new_key,
-# #         'values': stations_db[new_key].model_dump(mode='json'),
-# #         "snack": f"Успешно добавлена новая станция"
-# #     }
-# #     for conn in active_connections:
-# #         await conn.send_json(message)
-# #
-# #     return {"status": "success"}
-#
-#
+@app.post("/add_rule")
+async def add_rule(station_id: int, rule_option: str, rule_value: str, rule_period: int) -> dict[str, str]:
+    async with SessionLocal() as session:
+        async with session.begin():
+
+            rules = await session.execute(select(Rule).where(Rule.station_id == station_id))
+            if rules and len(rules.scalars().all()) >= 10:
+                await session.rollback()
+                message = {
+                    'action': 'snack',
+                    "snack": f"Достигнуто максимальное кол-во правил для этой станции (10)"
+                }
+                for conn in active_connections:
+                    await conn.send_json(message)
+                return {"status": "error"}
+
+            stations = await session.execute(
+                select(Station).where(Station.id == station_id).with_for_update())
+            result = stations.scalar_one_or_none()
+            if not result:
+                await session.rollback()
+                message = {
+                    "action": "delete",
+                    "station_id": station_id,
+                    "snack": f"Ошибка: Станции не существует"
+                }
+                for conn in active_connections:
+                    await conn.send_json(message)
+                return {"status": "error"}
+
+            session.add(Rule(rule_option=rule_option, rule_period=rule_period, rule_value=int(rule_value),
+                             station_id=station_id, active=False))
+            await session.commit()
+            await process_rules(station_id)
+            message = {
+                "action": "update",
+                "station_id": station_id,
+                "values": await get_station_object(result),
+                "snack": f"Правило успешно добавлено"
+            }
+
+            for conn in active_connections:
+                await conn.send_json(message)
+
+            return {"status": "success"}
+
+
+@app.post("/add_station")
+async def add_station(name: str, descr: str, lat: float, lng: float, activate: bool) -> dict[str, str]:
+    async with SessionLocal() as session:
+        async with session.begin():
+            stations = await session.execute(select(Station))
+            if stations and len(stations.scalars().all()) >= 25:
+                await session.rollback()
+                message = {
+                    'action': 'snack',
+                    "snack": f"Достигнуто максимальное кол-во станций (25)"
+                }
+                for conn in active_connections:
+                    await conn.send_json(message)
+                return {"status": "error"}
+
+            station = Station(name=name, description=descr, created_at=datetime.datetime.now(), updated_at=None,
+                              status='Выключено', lat=lat, lng=lng)
+            session.add(station)
+            await session.commit()
+
+        if activate:
+            await task_queue.put(station.id)
+            async with session.begin():
+                station.status = 'Обновление'
+                await session.commit()
+
+        message = {
+            "action": "update",
+            "station_id": station.id,
+            'values': await get_station_object(station),
+            "snack": f"Успешно добавлена новая станция"
+        }
+        for conn in active_connections:
+            await conn.send_json(message)
+
+        return {"status": "success"}
+
+
 @app.post("/delete_rule")
 async def delete_rule(station_id: int, rule_id: int) -> dict[str, str]:
     async with SessionLocal() as session:
         async with session.begin():
             stations = await session.execute(
-                select(Station).where(Station.id == station_id).with_for_update(skip_locked=True))
+                select(Station).where(Station.id == station_id).with_for_update())
             result = stations.scalar_one_or_none()
             if not result:
                 await session.rollback()
@@ -560,13 +546,14 @@ async def delete_rule(station_id: int, rule_id: int) -> dict[str, str]:
             return {"status": "success"}
 
 
-def process_task(station_id, lat, lng, result_queue):
+async def process_task(station_id, lat, lng):
+    await asyncio.sleep(20)
     try:
         # Обязательно использовать кеш предоставляемый open-meteo sdk
         predictions = [round(i, 4) for i in np.random.uniform(low=-30.0, high=30.0, size=673)],
         preds_datetime = [(datetime.datetime.now() - datetime.timedelta(hours=i)) for i in
                           range(672, -1, -1)],
-        result = [
+        return [
             Temperature(
                 value=predictions[i],
                 time=preds_datetime[i],
@@ -574,67 +561,132 @@ def process_task(station_id, lat, lng, result_queue):
             ) for i in range(763)
         ]
     except:
-        result = 'error'
-    result_queue.put(result)
+        return 'error'
 
 
 async def process_rules(station_id):
     async with SessionLocal() as session:
         async with session.begin():
-            pass
+
+            stations = await session.execute(
+                select(Station).where(Station.id == station_id))
+            stattion = stations.scalar_one_or_none()
+            if not stattion:
+                await session.rollback()
+                message = {
+                    "action": "delete",
+                    "station_id": station_id,
+                    "snack": f"Ошибка: Станции не существует"
+                }
+                for conn in active_connections:
+                    await conn.send_json(message)
+                return {"status": "error"}
+
+            rules = await session.execute(select(Rule).where(Rule.station_id == station_id).with_for_update())
+            rules_all = rules.scalars().all()
+            if rules_all:
+                temperatures = await session.execute(
+                    select(Temperature)
+                    .where(Temperature.station_id == station_id)
+                    .order_by(Temperature.time.desc()).with_for_update()
+                )
+                query_result = temperatures.scalars().all()
+                temps = [temp.value for temp in query_result]
+                if not temps:
+                    station = await session.execute(select(Station).where(Station.id == station_id))
+                    station = station.scalar_one_or_none()
+                    station.status = 'Ошибка'
+                    session.commit()
+                    return
+                for rule in rules_all:
+                    if rule.rule_option == 'больше':
+                        if temps[-rule.rule_period] > rule.rule_value:
+                            rule.active = True
+                        else:
+                            rule.active = False
+                    elif rule.rule_option == 'меньше':
+                        if temps[-rule.rule_period] < rule.rule_value:
+                            rule.active = True
+                        else:
+                            rule.active = False
+                    elif rule.rule_option == 'равна':
+                        if temps[-rule.rule_period] == rule.rule_value:
+                            rule.active = True
+                        else:
+                            rule.active = False
+                await session.commit()
+            else:
+                await session.rollback()
 
 
 async def run_worker():
     while True:
-        async with SessionLocal() as session:
-            async with session.begin():
-                try:
-                    station_id = q.get()
-                    stations = await session.execute(select(Station).where(Station.id == station_id).where(
-                        Station.status == 'Обновление').with_for_update(skip_locked=True))
-                    station = stations.scalar_one_or_none()
-                    if station:
-                        if station.updated_at < datetime.datetime.now().replace(minute=0, second=0, microsecond=0):
-                            result_queue = multiprocessing.Queue()
-                            p = multiprocessing.Process(
-                                target=process_task,
-                                args=(station_id, station.lat, station.lng, result_queue)
-                            )
-                            p.start()
-                            p.join()
-                            result = result_queue.get()
-                            if result == 'error':
+        try:
+            station_id = await task_queue.get()
+            async with SessionLocal() as session:
+                async with session.begin():
+                    station = await session.execute(
+                        select(Station).where(Station.id == station_id).with_for_update()
+                    )
+                    station = station.scalar_one_or_none()
+
+                    if station and station.status == 'Обновление':
+                        if station.updated_at is None or station.updated_at < datetime.datetime.now().replace(minute=0,
+                                                                                                              second=0,
+                                                                                                              microsecond=0):
+                            try:
+                                print(f'Делаем {station_id}')
+
+                                # result_queue = multiprocessing.Queue()
+                                # p = multiprocessing.Process(
+                                #     target=process_task,
+                                #     args=(station_id, station.lat, station.lng, result_queue)
+                                # )
+                                # p.start()
+                                # p.join()
+                                # result = result_queue.get()
+
+                                result = await process_task(station_id, station.lat, station.lng)
+
+                                if result == 'error':
+                                    station.status = 'Ошибка'
+                                    await session.commit()
+                                    message = {
+                                        "action": "update",
+                                        "station_id": station_id,
+                                        "values": await get_station_object(station),
+                                    }
+                                    for conn in active_connections:
+                                        await conn.send_json(message)
+                                else:
+                                    await session.execute(
+                                        delete(Temperature).where(Temperature.station_id == station_id)
+                                    )
+                                    session.add_all(result)
+                                    await session.commit()
+                                    await task_queue.put(station_id)
+                            except:
                                 station.status = 'Ошибка'
-                                await session.commit()
-                            else:
-                                await session.execute(
-                                    delete(Temperature).where(Temperature.station_id == station_id)
-                                )
-                                session.add_all(result)
                                 await session.commit()
                         else:
                             station.status = 'В норме'
                             await session.commit()
+                            await process_rules(station_id)
+                            message = {
+                                "action": "update",
+                                "station_id": station_id,
+                                "values": await get_station_object(station),
+                            }
+                            for conn in active_connections:
+                                await conn.send_json(message)
+
                     else:
                         await session.rollback()
-                    q.task_done()
-                    await process_rules(station_id)
-                    message = {
-                        "action": "update",
-                        "station_id": station_id,
-                        "values": await get_station_object(station),
-                    }
-                    for conn in active_connections:
-                        await conn.send_json(message)
-
-                except queue.Empty:
-                    await session.rollback()
-                    # Очередь пуста, продолжаем цикл
-                    continue
-                except Exception as e:
-                    print(f"Worker error: {e}")
-                finally:
-                    time.sleep(1)
+        except asyncio.QueueEmpty:
+            await asyncio.sleep(1)
+        except Exception as e:
+            print(f"Worker error: {e}")
+            await asyncio.sleep(1)
 
 
 # Запуск сервера

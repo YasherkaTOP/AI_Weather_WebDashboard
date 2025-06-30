@@ -570,7 +570,7 @@ class StationPage:
         self.page.update()
 
     async def add_new_rule(self, e):
-        if len(self.station.rules) >= 10:
+        if self.station.rules and len(self.station.rules) >= 10:
             self.page.open(
                 ft.SnackBar(content=ft.Text(value='Нельзя создать больше 10 правил'), bgcolor=ft.Colors.ORANGE))
         else:
@@ -579,9 +579,9 @@ class StationPage:
                 ft.DropdownOption('больше'),
                 ft.DropdownOption('меньше'),
             ])
-            self.rule_sign = ft.Dropdown(width=73, options=[ft.DropdownOption('+'), ft.DropdownOption('-')])
-            self.rule_value = ft.TextField(input_filter=ft.NumbersOnlyInputFilter(), width=50)
-            self.rule_period = ft.TextField(input_filter=ft.NumbersOnlyInputFilter(), width=50)
+            # self.rule_sign = ft.Dropdown(width=73, options=[ft.DropdownOption('+'), ft.DropdownOption('-')])  ^[-]?\d+
+            self.rule_value = ft.TextField(input_filter=ft.InputFilter(regex_string=r'^[-]?[0-9]{0,2}$'), width=70)
+            self.rule_period = ft.TextField(input_filter=ft.InputFilter(regex_string=r'^[0-9]{0,3}$'), width=60)
             self.page.overlay.append(ft.Container(bgcolor=ft.Colors.with_opacity(0.5, ft.Colors.BLACK),
                                                   padding=20, expand=True,
                                                   alignment=ft.alignment.center,
@@ -597,7 +597,7 @@ class StationPage:
                                                       ft.Row(controls=[
                                                           ft.Text(value='Температура', color=ft.Colors.BLACK),
                                                           self.rule_option,
-                                                          self.rule_sign,
+                                                          # self.rule_sign,
                                                           self.rule_value,
                                                           ft.Text(value='через', color=ft.Colors.BLACK),
                                                           self.rule_period,
@@ -621,24 +621,28 @@ class StationPage:
         if self.app_manager.is_requesting:
             pass
         else:
-            if self.rule_period.value > 168:
-                self.page.open(
-                    ft.SnackBar(content=ft.Text(value='Период не может быть больше 168 часов (неделя)'), bgcolor=ft.Colors.ORANGE))
+            if self.rule_option.value and self.rule_value.value and self.rule_period.value:
+                if int(self.rule_period.value) > 168:
+                    self.page.open(
+                        ft.SnackBar(content=ft.Text(value='Период не может быть больше 168 часов (неделя)'), bgcolor=ft.Colors.ORANGE))
+                else :
+                    self.close_overlay(None)
+                    async with ClientSession() as session:
+                        try:
+                            self.app_manager.is_requesting = True
+                            await session.post(
+                                ADD_RULE_URL + f'?station_id={self.station.id}&rule_option={self.rule_option.value}&rule_value={self.rule_value.value}&rule_period={self.rule_period.value}'
+                            )
+                        except Exception as e:
+                            self.page.open(
+                                ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
+                            print(f"Error: {e}")
+                        finally:
+                            await session.close()
+                            self.app_manager.is_requesting = False
             else:
-                self.close_overlay(None)
-                async with ClientSession() as session:
-                    try:
-                        self.app_manager.is_requesting = True
-                        await session.post(
-                            ADD_RULE_URL + f'?station_id={self.station.id}&rule_option={self.rule_option.value}&rule_value={self.rule_sign.value}{self.rule_value.value}&rule_period={self.rule_period.value}'
-                        )
-                    except Exception as e:
-                        self.page.open(
-                            ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
-                        print(f"Error: {e}")
-                    finally:
-                        await session.close()
-                        self.app_manager.is_requesting = False
+                self.page.open(
+                    ft.SnackBar(content=ft.Text(value='Все поля должны быть заполнены'), bgcolor=ft.Colors.ORANGE))
 
     async def delete_rule(self, rule_id):
         if self.app_manager.is_requesting:
@@ -745,20 +749,24 @@ class StationPage:
         if self.app_manager.is_requesting:
             pass
         else:
-            self.close_overlay(None)
-            async with ClientSession() as session:
-                try:
-                    self.app_manager.is_requesting = True
-                    await session.post(
-                        EDIT_STATION_URL + f'?station_id={self.station.id}&name={self.station_newname.value}&descr={self.station_newdesc.value}'
-                    )
-                except Exception as e:
-                    self.page.open(
-                        ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
-                    print(f"Error: {e}")
-                finally:
-                    await session.close()
-                    self.app_manager.is_requesting = False
+            if self.station_newname.value and self.station_newdesc.value:
+                self.close_overlay(None)
+                async with ClientSession() as session:
+                    try:
+                        self.app_manager.is_requesting = True
+                        await session.post(
+                            EDIT_STATION_URL + f'?station_id={self.station.id}&name={self.station_newname.value}&descr={self.station_newdesc.value}'
+                        )
+                    except Exception as e:
+                        self.page.open(
+                            ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
+                        print(f"Error: {e}")
+                    finally:
+                        await session.close()
+                        self.app_manager.is_requesting = False
+            else:
+                self.page.open(
+                    ft.SnackBar(content=ft.Text(value='Название и описание не могут быть пустыми'), bgcolor=ft.Colors.ORANGE))
 
 
 class MainPage:
@@ -1111,19 +1119,27 @@ class MainPage:
         if self.app_manager.is_requesting:
             pass
         else:
-            async with ClientSession() as session:
-                try:
-                    self.app_manager.is_requesting = True
-                    await session.post(
-                        ADD_STATION_URL + f'?name={name}&descr={descr}&lat={lat}&lng={lng}&activate={activate}'
-                    )
-                except Exception as e:
+            if name and descr and lat and lng:
+                if self.stations and len(self.stations) < 25:
+                    async with ClientSession() as session:
+                        try:
+                            self.app_manager.is_requesting = True
+                            await session.post(
+                                ADD_STATION_URL + f'?name={name}&descr={descr}&lat={lat}&lng={lng}&activate={activate}'
+                            )
+                        except Exception as e:
+                            self.page.open(
+                                ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
+                            print(f"Error: {e}")
+                        finally:
+                            await session.close()
+                            self.app_manager.is_requesting = False
+                else:
                     self.page.open(
-                        ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
-                    print(f"Error: {e}")
-                finally:
-                    await session.close()
-                    self.app_manager.is_requesting = False
+                        ft.SnackBar(content=ft.Text(value='Достигнуто максимальное кол-во станций (25)'), bgcolor=ft.Colors.ORANGE))
+            else:
+                self.page.open(
+                    ft.SnackBar(content=ft.Text(value='Все поля должны быть заполнены'), bgcolor=ft.Colors.ORANGE))
 
     def close_overlay(self, e):
         self.page.overlay.clear()
