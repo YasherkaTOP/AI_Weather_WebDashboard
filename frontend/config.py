@@ -1,0 +1,10 @@
+WEBSOCKET_IP = 'http://localhost:8080/ws'
+RECONNECT_DELAY = 10
+STATIONS_API = 'http://localhost:8080/stations'
+DELETE_URL = 'http://localhost:8080/delete_station'
+EDIT_STATION_URL = 'http://localhost:8080/edit_station'
+RELOAD_URL = 'http://localhost:8080/reload_station'
+TOGGLE_URL = 'http://localhost:8080/toggle_station'
+DELETE_RULE_URL = 'http://localhost:8080/delete_rule'
+ADD_RULE_URL = 'http://localhost:8080/add_rule'
+ADD_STATION_URL = 'http://localhost:8080/add_station'
