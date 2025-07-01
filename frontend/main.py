@@ -65,7 +65,6 @@ async def websocket_client():
                     async for msg in ws:
                         if msg.type == web.WSMsgType.TEXT:
                             data = msg.json()
-                            print('Пришло изменение')
                             if data['action'] == 'update':
                                 await app_manager.update_station(int(data['station_id']), Station(**data['values']))
                             elif data['action'] == 'delete':

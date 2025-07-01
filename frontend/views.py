@@ -1,10 +1,8 @@
 import asyncio
 import datetime
-
 import numpy as np
 import flet_map as map
 from aiohttp import ClientSession
-
 from models import Station
 import flet as ft
 from config import DELETE_URL, RELOAD_URL, TOGGLE_URL, DELETE_RULE_URL, ADD_RULE_URL, ADD_STATION_URL, EDIT_STATION_URL
@@ -1120,23 +1118,23 @@ class MainPage:
             pass
         else:
             if name and descr and lat and lng:
-                if self.stations and len(self.stations) < 25:
-                    async with ClientSession() as session:
-                        try:
-                            self.app_manager.is_requesting = True
-                            await session.post(
-                                ADD_STATION_URL + f'?name={name}&descr={descr}&lat={lat}&lng={lng}&activate={activate}'
-                            )
-                        except Exception as e:
-                            self.page.open(
-                                ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
-                            print(f"Error: {e}")
-                        finally:
-                            await session.close()
-                            self.app_manager.is_requesting = False
-                else:
-                    self.page.open(
-                        ft.SnackBar(content=ft.Text(value='Достигнуто максимальное кол-во станций (25)'), bgcolor=ft.Colors.ORANGE))
+                    if self.stations and len(self.stations) < 25:
+                        async with ClientSession() as session:
+                            try:
+                                self.app_manager.is_requesting = True
+                                await session.post(
+                                    ADD_STATION_URL + f'?name={name}&descr={descr}&lat={lat}&lng={lng}&activate={activate}'
+                                )
+                            except Exception as e:
+                                self.page.open(
+                                    ft.SnackBar(content=ft.Text(value='Сервер недоступен, запрос отклонен'), bgcolor=ft.Colors.RED))
+                                print(f"Error: {e}")
+                            finally:
+                                await session.close()
+                                self.app_manager.is_requesting = False
+                    else:
+                        self.page.open(
+                            ft.SnackBar(content=ft.Text(value='Достигнуто максимальное кол-во станций (25)'), bgcolor=ft.Colors.ORANGE))
             else:
                 self.page.open(
                     ft.SnackBar(content=ft.Text(value='Все поля должны быть заполнены'), bgcolor=ft.Colors.ORANGE))

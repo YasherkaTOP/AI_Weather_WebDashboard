@@ -1,7 +1,8 @@
 import os
+from concurrent.futures.process import ProcessPoolExecutor
 
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks
 from pydantic import BaseModel
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, select, delete, \
     BOOLEAN
@@ -10,13 +11,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 import datetime
 import asyncio
 from typing import List, Optional
+from geopy import distance
 
 # Инициализация приложения
 app = FastAPI()
 
 # Конфигурация БД
-if os.path.exists('database.db'):
-    os.remove('database.db')
+# if os.path.exists('database.db'):
+#     os.remove('database.db')
 DATABASE_URL = "sqlite+aiosqlite:///./database.db"
 engine = create_async_engine(DATABASE_URL)
 SessionLocal = sessionmaker(
@@ -147,6 +149,7 @@ async def init_db():
                     Rule(id=17, rule_option='меньше', rule_period=1, rule_value=8, station_id=5)
                 ])
                 await session.commit()
+                print('Конец ДБ')
 
 
 async def get_station_object(station):
@@ -213,18 +216,17 @@ async def get_station_object(station):
 
 @app.on_event("startup")
 async def startup():
-    await init_db()
+    # await init_db()
 
-    # Загрузка прерванных обновляемых станций в очередь
     async with SessionLocal() as session:
+        # Загрузка прерванных обновляемых станций в очередь
         stations = await session.execute(
             select(Station).where(Station.status == 'Обновление')
         )
         for station in stations.scalars().all():
             await task_queue.put(station.id)
 
-    # Проверка устаревших станций
-    async with SessionLocal() as session:
+        # Проверка устаревших станций
         stations = await session.execute(
             select(Station).where(
                 Station.updated_at < datetime.datetime.now().replace(minute=0, second=0, microsecond=0))
@@ -233,7 +235,9 @@ async def startup():
             if station.status == 'В норме':
                 station.status = 'Обновление'
                 await task_queue.put(station.id)
-                await session.commit()
+        await session.commit()
+
+    asyncio.create_task(run_worker())
 
 
 # WebSocket эндпоинт
@@ -332,7 +336,7 @@ async def reload_station(station_id: int) -> dict[str, str]:
                 "action": "update",
                 "station_id": station_id,
                 "values": await get_station_object(result),
-                "snack": f"Ошибка: Станция не может быть перезагружена"
+                "snack": f"Станция отправлена на перезагрузку"
             }
             for conn in active_connections:
                 await conn.send_json(message)
@@ -468,7 +472,8 @@ async def add_station(name: str, descr: str, lat: float, lng: float, activate: b
     async with SessionLocal() as session:
         async with session.begin():
             stations = await session.execute(select(Station))
-            if stations and len(stations.scalars().all()) >= 25:
+            sts = stations.scalars().all()
+            if stations and len(sts) >= 25:
                 await session.rollback()
                 message = {
                     'action': 'snack',
@@ -477,6 +482,17 @@ async def add_station(name: str, descr: str, lat: float, lng: float, activate: b
                 for conn in active_connections:
                     await conn.send_json(message)
                 return {"status": "error"}
+            new_coords = (lat, lng)
+            for station in sts:
+                if distance.distance(new_coords, (station.lat, station.lng)).km > 10:
+                    await session.rollback()
+                    message = {
+                        'action': 'snack',
+                        "snack": f"Станция не может быть ближе 10км к другой"
+                    }
+                    for conn in active_connections:
+                        await conn.send_json(message)
+                    return {"status": "error"}
 
             station = Station(name=name, description=descr, created_at=datetime.datetime.now(), updated_at=None,
                               status='Выключено', lat=lat, lng=lng)
@@ -546,20 +562,13 @@ async def delete_rule(station_id: int, rule_id: int) -> dict[str, str]:
             return {"status": "success"}
 
 
-async def process_task(station_id, lat, lng):
-    await asyncio.sleep(20)
+def process_task(lat, lng):
     try:
         # Обязательно использовать кеш предоставляемый open-meteo sdk
         predictions = [round(i, 4) for i in np.random.uniform(low=-30.0, high=30.0, size=673)],
         preds_datetime = [(datetime.datetime.now() - datetime.timedelta(hours=i)) for i in
                           range(672, -1, -1)],
-        return [
-            Temperature(
-                value=predictions[i],
-                time=preds_datetime[i],
-                station_id=station_id
-            ) for i in range(763)
-        ]
+        return predictions, preds_datetime
     except:
         return 'error'
 
@@ -620,6 +629,7 @@ async def process_rules(station_id):
 
 
 async def run_worker():
+    executor = ProcessPoolExecutor(max_workers=1)
     while True:
         try:
             station_id = await task_queue.get()
@@ -635,58 +645,54 @@ async def run_worker():
                                                                                                               second=0,
                                                                                                               microsecond=0):
                             try:
-                                print(f'Делаем {station_id}')
-
-                                # result_queue = multiprocessing.Queue()
-                                # p = multiprocessing.Process(
-                                #     target=process_task,
-                                #     args=(station_id, station.lat, station.lng, result_queue)
-                                # )
-                                # p.start()
-                                # p.join()
-                                # result = result_queue.get()
-
-                                result = await process_task(station_id, station.lat, station.lng)
+                                loop = asyncio.get_event_loop()
+                                latt = station.lat
+                                lngt = station.lng
+                                result = await loop.run_in_executor(executor, process_task, latt,
+                                                                    lngt)
 
                                 if result == 'error':
                                     station.status = 'Ошибка'
                                     await session.commit()
-                                    message = {
-                                        "action": "update",
-                                        "station_id": station_id,
-                                        "values": await get_station_object(station),
-                                    }
-                                    for conn in active_connections:
-                                        await conn.send_json(message)
                                 else:
+                                    temp, date = result[0][0], result[1][0]
+                                    new_data = [
+                                        Temperature(
+                                            value=temp[i],
+                                            time=date[i],
+                                            station_id=station_id
+                                        ) for i in range(len(temp))
+                                    ]
+
                                     await session.execute(
                                         delete(Temperature).where(Temperature.station_id == station_id)
                                     )
-                                    session.add_all(result)
+                                    session.add_all(new_data)
+                                    station.updated_at = datetime.datetime.now().replace(minute=0, second=0, microsecond=0)
                                     await session.commit()
                                     await task_queue.put(station_id)
-                            except:
+                            except Exception as e:
+                                print(e)
                                 station.status = 'Ошибка'
                                 await session.commit()
+
                         else:
                             station.status = 'В норме'
                             await session.commit()
                             await process_rules(station_id)
-                            message = {
-                                "action": "update",
-                                "station_id": station_id,
-                                "values": await get_station_object(station),
-                            }
-                            for conn in active_connections:
-                                await conn.send_json(message)
 
                     else:
                         await session.rollback()
-        except asyncio.QueueEmpty:
-            await asyncio.sleep(1)
-        except Exception as e:
-            print(f"Worker error: {e}")
-            await asyncio.sleep(1)
+            message = {
+                "action": "update",
+                "station_id": station_id,
+                "values": await get_station_object(station),
+                'snack': None
+            }
+            for conn in active_connections:
+                await conn.send_json(message)
+        except:
+            await asyncio.sleep(2)
 
 
 # Запуск сервера
