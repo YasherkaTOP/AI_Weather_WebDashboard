@@ -1,0 +1,4 @@
+aiohttp==3.12.9
+flet==0.28.3
+flet_map==0.1.0
+numpy==1.24.1

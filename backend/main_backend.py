@@ -1,17 +1,20 @@
+import asyncio
+import datetime
 import os
 from concurrent.futures.process import ProcessPoolExecutor
+from typing import List, Optional
 
-import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from geopy import distance
 from pydantic import BaseModel
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, select, delete, \
     BOOLEAN
-from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-import datetime
-import asyncio
-from typing import List, Optional
-from geopy import distance
+from sqlalchemy.orm import sessionmaker, declarative_base
+
+from ai_task import process_task
 
 # Инициализация приложения
 app = FastAPI()
@@ -56,7 +59,7 @@ class Station(Base):
     status = Column(String)
     lat = Column(Float)
     lng = Column(Float)
-    created_at = Column(DateTime, default=datetime.datetime.now)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=None)
 
 
@@ -85,71 +88,70 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-        # Это для примера заполняем различные данные
-        async with SessionLocal() as session:
-            async with session.begin():
-                # Пользователи
-                session.add_all([
-                    Station(id=0, name="Name 0", description="Description 0",
-                            created_at=datetime.datetime.now(),
-                            updated_at=datetime.datetime.now(), status='В норме',
-                            lat=round(np.random.uniform(-80, 80), 3), lng=round(np.random.uniform(-150, 150), 3)),
-                    Station(id=1, name="Name 1", description="Description 1",
-                            created_at=datetime.datetime.now(),
-                            updated_at=(datetime.datetime.now() - datetime.timedelta(hours=1)), status='В норме',
-                            lat=round(np.random.uniform(-80, 80), 3), lng=round(np.random.uniform(-150, 150), 3)),
-                    Station(id=2, name="Name 2", description="Description 2",
-                            created_at=datetime.datetime.now(),
-                            updated_at=None, status='Ошибка',
-                            lat=round(np.random.uniform(-80, 80), 3), lng=round(np.random.uniform(-150, 150), 3)),
-                    Station(id=3, name="Name 3", description="Description 3",
-                            created_at=datetime.datetime.now(),
-                            updated_at=(datetime.datetime.now() - datetime.timedelta(hours=2)), status='Обновление',
-                            lat=round(np.random.uniform(-80, 80), 3), lng=round(np.random.uniform(-150, 150), 3)),
-                    Station(id=4, name="Name 4", description="Description 4",
-                            created_at=datetime.datetime.now(),
-                            updated_at=(datetime.datetime.now() - datetime.timedelta(hours=2)), status='Выключено',
-                            lat=round(np.random.uniform(-80, 80), 3), lng=round(np.random.uniform(-150, 150), 3)),
-                    Station(id=5, name="Name 5", description="Description 5",
-                            created_at=datetime.datetime.now(),
-                            updated_at=datetime.datetime.now(), status='Выключено',
-                            lat=round(np.random.uniform(-80, 80), 3), lng=round(np.random.uniform(-150, 150), 3)),
-                    Station(id=6, name="Name 6", description="Description 6",
-                            created_at=datetime.datetime.now(),
-                            updated_at=datetime.datetime.now(), status='Обновление',
-                            lat=round(np.random.uniform(-80, 80), 3), lng=round(np.random.uniform(-150, 150), 3)),
-                ])
-
-                temps = []
-                for st_id in range(7):
-                    for i in range(672, -1, -1):
-                        temps.append(Temperature(station_id=st_id,
-                                                 time=(datetime.datetime.now() - datetime.timedelta(hours=i)),
-                                                 value=round(np.random.uniform(low=-30.0, high=30.0), 4)))
-                session.add_all(temps)
-
-                session.add_all([
-                    Rule(id=0, rule_option='больше', rule_period=2, rule_value=10, station_id=0, active=True),
-                    Rule(id=1, rule_option='равно', rule_period=3, rule_value=12, station_id=0, active=True),
-                    Rule(id=2, rule_option='меньше', rule_period=1, rule_value=8, station_id=0, active=True),
-                    Rule(id=3, rule_option='больше', rule_period=2, rule_value=10, station_id=1, active=True),
-                    Rule(id=4, rule_option='равно', rule_period=3, rule_value=12, station_id=1, active=True),
-                    Rule(id=5, rule_option='меньше', rule_period=1, rule_value=8, station_id=1, active=True),
-                    Rule(id=6, rule_option='больше', rule_period=2, rule_value=10, station_id=2, active=True),
-                    Rule(id=7, rule_option='равно', rule_period=3, rule_value=12, station_id=2, active=True),
-                    Rule(id=8, rule_option='меньше', rule_period=1, rule_value=8, station_id=2, active=True),
-                    Rule(id=9, rule_option='больше', rule_period=2, rule_value=10, station_id=3, active=True),
-                    Rule(id=10, rule_option='равно', rule_period=3, rule_value=12, station_id=3, active=True),
-                    Rule(id=11, rule_option='меньше', rule_period=1, rule_value=8, station_id=3, active=True),
-                    Rule(id=12, rule_option='больше', rule_period=2, rule_value=10, station_id=4),
-                    Rule(id=13, rule_option='равно', rule_period=3, rule_value=12, station_id=4),
-                    Rule(id=14, rule_option='меньше', rule_period=1, rule_value=8, station_id=4),
-                    Rule(id=15, rule_option='больше', rule_period=2, rule_value=10, station_id=5),
-                    Rule(id=16, rule_option='равно', rule_period=3, rule_value=12, station_id=5),
-                    Rule(id=17, rule_option='меньше', rule_period=1, rule_value=8, station_id=5)
-                ])
-                await session.commit()
-                print('Конец ДБ')
+        # Это различные данные для теста
+        # async with SessionLocal() as session:
+        #     async with session.begin():
+        #         # Пользователи
+        #         session.add_all([
+        #             Station(id=0, name="Name 0", description="Description 0",
+        #                     created_at=datetime.datetime.utcnow(),
+        #                     updated_at=datetime.datetime.utcnow(), status='В норме',
+        #                     lat=round(np.random.uniform(-80, 80), 3), lng=round(np.random.uniform(-150, 150), 3)),
+        #             Station(id=1, name="Name 1", description="Description 1",
+        #                     created_at=datetime.datetime.utcnow(),
+        #                     updated_at=(datetime.datetime.utcnow() - datetime.timedelta(hours=1)), status='В норме',
+        #                     lat=round(np.random.uniform(-80, 80), 3), lng=round(np.random.uniform(-150, 150), 3)),
+        #             Station(id=2, name="Name 2", description="Description 2",
+        #                     created_at=datetime.datetime.utcnow(),
+        #                     updated_at=None, status='Ошибка',
+        #                     lat=round(np.random.uniform(-80, 80), 3), lng=round(np.random.uniform(-150, 150), 3)),
+        #             Station(id=3, name="Name 3", description="Description 3",
+        #                     created_at=datetime.datetime.utcnow(),
+        #                     updated_at=(datetime.datetime.utcnow() - datetime.timedelta(hours=2)), status='Обновление',
+        #                     lat=round(np.random.uniform(-80, 80), 3), lng=round(np.random.uniform(-150, 150), 3)),
+        #             Station(id=4, name="Name 4", description="Description 4",
+        #                     created_at=datetime.datetime.utcnow(),
+        #                     updated_at=(datetime.datetime.utcnow() - datetime.timedelta(hours=2)), status='Выключено',
+        #                     lat=round(np.random.uniform(-80, 80), 3), lng=round(np.random.uniform(-150, 150), 3)),
+        #             Station(id=5, name="Name 5", description="Description 5",
+        #                     created_at=datetime.datetime.utcnow(),
+        #                     updated_at=datetime.datetime.utcnow(), status='Выключено',
+        #                     lat=round(np.random.uniform(-80, 80), 3), lng=round(np.random.uniform(-150, 150), 3)),
+        #             Station(id=6, name="Name 6", description="Description 6",
+        #                     created_at=datetime.datetime.utcnow(),
+        #                     updated_at=datetime.datetime.utcnow() - datetime.timedelta(hours=1), status='Обновление',
+        #                     lat=round(np.random.uniform(-80, 80), 3), lng=round(np.random.uniform(-150, 150), 3)),
+        #         ])
+        #
+        #         temps = []
+        #         for st_id in range(7):
+        #             for i in range(672, -1, -1):
+        #                 temps.append(Temperature(station_id=st_id,
+        #                                          time=(datetime.datetime.utcnow() - datetime.timedelta(hours=i)),
+        #                                          value=round(np.random.uniform(low=-30.0, high=30.0), 2)))
+        #         session.add_all(temps)
+        #
+        #         session.add_all([
+        #             Rule(id=0, rule_option='больше', rule_period=2, rule_value=10, station_id=0, active=True),
+        #             Rule(id=1, rule_option='равно', rule_period=3, rule_value=12, station_id=0, active=True),
+        #             Rule(id=2, rule_option='меньше', rule_period=1, rule_value=8, station_id=0, active=True),
+        #             Rule(id=3, rule_option='больше', rule_period=2, rule_value=10, station_id=1, active=True),
+        #             Rule(id=4, rule_option='равно', rule_period=3, rule_value=12, station_id=1, active=True),
+        #             Rule(id=5, rule_option='меньше', rule_period=1, rule_value=8, station_id=1, active=True),
+        #             Rule(id=6, rule_option='больше', rule_period=2, rule_value=10, station_id=2, active=True),
+        #             Rule(id=7, rule_option='равно', rule_period=3, rule_value=12, station_id=2, active=True),
+        #             Rule(id=8, rule_option='меньше', rule_period=1, rule_value=8, station_id=2, active=True),
+        #             Rule(id=9, rule_option='больше', rule_period=2, rule_value=10, station_id=3, active=True),
+        #             Rule(id=10, rule_option='равно', rule_period=3, rule_value=12, station_id=3, active=True),
+        #             Rule(id=11, rule_option='меньше', rule_period=1, rule_value=8, station_id=3, active=True),
+        #             Rule(id=12, rule_option='больше', rule_period=2, rule_value=10, station_id=4),
+        #             Rule(id=13, rule_option='равно', rule_period=3, rule_value=12, station_id=4),
+        #             Rule(id=14, rule_option='меньше', rule_period=1, rule_value=8, station_id=4),
+        #             Rule(id=15, rule_option='больше', rule_period=2, rule_value=10, station_id=5),
+        #             Rule(id=16, rule_option='равно', rule_period=3, rule_value=12, station_id=5),
+        #             Rule(id=17, rule_option='меньше', rule_period=1, rule_value=8, station_id=5)
+        #         ])
+        #         await session.commit()
 
 
 async def get_station_object(station):
@@ -172,10 +174,9 @@ async def get_station_object(station):
                 temps_list = [t.value for t in temps]
                 times_list = [t.time.strftime("%Y-%m-%d %H:%M:%S") for t in temps]
 
-                last_temp = temps_list[-1] if temps_list else None
-                if len(temps_list) > 1:
-                    predictions = temps_list[:-1]
-                    dates = times_list[:-1]
+                last_temp = temps_list[1] if temps_list else None
+                predictions = temps_list[1:]
+                dates = times_list[1:]
 
             # Получаем правила
             rules_query = await session.execute(
@@ -214,10 +215,24 @@ async def get_station_object(station):
             ).model_dump(mode='json')
 
 
+async def run_update_task():
+    async with SessionLocal() as session:
+        # Проверка устаревших станций
+        stations = await session.execute(
+            select(Station).where(
+                Station.updated_at < datetime.datetime.utcnow().replace(minute=0, second=0, microsecond=0))
+        )
+        for station in stations.scalars().all():
+            if station.status == 'В норме':
+                station.status = 'Обновление'
+                await task_queue.put(station.id)
+        await session.commit()
+
+
 @app.on_event("startup")
 async def startup():
-    # await init_db()
-
+    if not os.path.exists('database.db'):
+        await init_db()
     async with SessionLocal() as session:
         # Загрузка прерванных обновляемых станций в очередь
         stations = await session.execute(
@@ -229,7 +244,7 @@ async def startup():
         # Проверка устаревших станций
         stations = await session.execute(
             select(Station).where(
-                Station.updated_at < datetime.datetime.now().replace(minute=0, second=0, microsecond=0))
+                Station.updated_at < datetime.datetime.utcnow().replace(minute=0, second=0, microsecond=0))
         )
         for station in stations.scalars().all():
             if station.status == 'В норме':
@@ -238,6 +253,14 @@ async def startup():
         await session.commit()
 
     asyncio.create_task(run_worker())
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        run_update_task,
+        CronTrigger(minute=0),
+        id="hourly_job",
+        replace_existing=True
+    )
+    scheduler.start()
 
 
 # WebSocket эндпоинт
@@ -484,7 +507,7 @@ async def add_station(name: str, descr: str, lat: float, lng: float, activate: b
                 return {"status": "error"}
             new_coords = (lat, lng)
             for station in sts:
-                if distance.distance(new_coords, (station.lat, station.lng)).km > 10:
+                if distance.distance(new_coords, (station.lat, station.lng)).km < 10:
                     await session.rollback()
                     message = {
                         'action': 'snack',
@@ -494,7 +517,7 @@ async def add_station(name: str, descr: str, lat: float, lng: float, activate: b
                         await conn.send_json(message)
                     return {"status": "error"}
 
-            station = Station(name=name, description=descr, created_at=datetime.datetime.now(), updated_at=None,
+            station = Station(name=name, description=descr,
                               status='Выключено', lat=lat, lng=lng)
             session.add(station)
             await session.commit()
@@ -560,17 +583,6 @@ async def delete_rule(station_id: int, rule_id: int) -> dict[str, str]:
             for conn in active_connections:
                 await conn.send_json(message)
             return {"status": "success"}
-
-
-def process_task(lat, lng):
-    try:
-        # Обязательно использовать кеш предоставляемый open-meteo sdk
-        predictions = [round(i, 4) for i in np.random.uniform(low=-30.0, high=30.0, size=673)],
-        preds_datetime = [(datetime.datetime.now() - datetime.timedelta(hours=i)) for i in
-                          range(672, -1, -1)],
-        return predictions, preds_datetime
-    except:
-        return 'error'
 
 
 async def process_rules(station_id):
@@ -641,9 +653,10 @@ async def run_worker():
                     station = station.scalar_one_or_none()
 
                     if station and station.status == 'Обновление':
-                        if station.updated_at is None or station.updated_at < datetime.datetime.now().replace(minute=0,
-                                                                                                              second=0,
-                                                                                                              microsecond=0):
+                        if station.updated_at is None or station.updated_at < datetime.datetime.utcnow().replace(
+                                minute=0,
+                                second=0,
+                                microsecond=0):
                             try:
                                 loop = asyncio.get_event_loop()
                                 latt = station.lat
@@ -655,20 +668,21 @@ async def run_worker():
                                     station.status = 'Ошибка'
                                     await session.commit()
                                 else:
-                                    temp, date = result[0][0], result[1][0]
+                                    temp, date = result[0], result[1]
                                     new_data = [
                                         Temperature(
-                                            value=temp[i],
+                                            value=round(temp[i], 2),
                                             time=date[i],
                                             station_id=station_id
-                                        ) for i in range(len(temp))
+                                        ) for i in range(673)
                                     ]
 
                                     await session.execute(
                                         delete(Temperature).where(Temperature.station_id == station_id)
                                     )
                                     session.add_all(new_data)
-                                    station.updated_at = datetime.datetime.now().replace(minute=0, second=0, microsecond=0)
+                                    station.updated_at = datetime.datetime.utcnow().replace(minute=0, second=0,
+                                                                                            microsecond=0)
                                     await session.commit()
                                     await task_queue.put(station_id)
                             except Exception as e:

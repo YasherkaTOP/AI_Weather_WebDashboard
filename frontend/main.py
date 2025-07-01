@@ -1,15 +1,10 @@
 import asyncio
-
-import numpy as np
 from aiohttp import ClientSession, web, ClientConnectionError
-
 from models import Station
 from config import RECONNECT_DELAY, WEBSOCKET_IP, STATIONS_API
 import flet as ft
 from views import StationPage, MainPage
 import base64
-import datetime
-from typing import Dict
 
 with open("assets/logo.png", "rb") as image_file:
     encoded_string = base64.b64encode(image_file.read()).decode('utf-8')

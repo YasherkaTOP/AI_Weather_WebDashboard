@@ -966,7 +966,7 @@ class MainPage:
         self.page.update()
 
     def _on_coord_click(self, lat, lng):
-        now = datetime.datetime.now()
+        now = datetime.datetime.utcnow()
         if self.last_click_time and (now - self.last_click_time).total_seconds() < 1:
             self.page.open(ft.SnackBar(content=ft.Text(value='Не так быстро!'), bgcolor=ft.Colors.ORANGE))
         self.last_click_time = now
