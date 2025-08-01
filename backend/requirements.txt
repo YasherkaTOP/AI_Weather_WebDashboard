@@ -1,0 +1,14 @@
+APScheduler==3.11.0
+fastapi==0.115.14
+geopy==2.4.1
+numpy==1.24.1
+openmeteo_requests==1.5.0
+pandas==1.5.2
+pydantic==2.11.7
+pytorch_forecasting==1.4.0
+requests_cache==1.2.1
+retry_requests==2.0.0
+scipy==1.16.0
+SQLAlchemy==2.0.37
+statsmodels==0.14.4
+uvicorn==0.35.0
