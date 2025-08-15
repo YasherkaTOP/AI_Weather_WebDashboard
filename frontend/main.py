@@ -1,7 +1,7 @@
 import asyncio
 from aiohttp import ClientSession, web, ClientConnectionError
 from models import Station
-from config import RECONNECT_DELAY, WEBSOCKET_IP, STATIONS_API
+from config import RECONNECT_DELAY, WEBSOCKET_URL, STATIONS_URL
 import flet as ft
 from views import StationPage, MainPage
 import base64
@@ -54,7 +54,7 @@ async def websocket_client():
     while True:
         try:
             async with ClientSession() as session:
-                async with session.ws_connect(WEBSOCKET_IP) as ws:
+                async with session.ws_connect(WEBSOCKET_URL) as ws:
                     print("WebSocket connected")
                     await load_full_data_from_backend()
                     async for msg in ws:
@@ -99,7 +99,7 @@ async def load_full_data_from_backend():
     # Здесь реализуем загрузку полных данных с бекенда
     try:
         async with ClientSession() as session:
-            async with session.get(STATIONS_API) as response:
+            async with session.get(STATIONS_URL) as response:
                 if response.status == 200:
                     data = await response.json()
                     # Обновляем локальное состояние

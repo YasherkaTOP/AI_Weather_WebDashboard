@@ -15,14 +15,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 from ai_task import process_task
+from config import DATABASE_URL
 
 # Инициализация приложения
 app = FastAPI()
 
 # Конфигурация БД
-# if os.path.exists('database.db'):
-#     os.remove('database.db')
-DATABASE_URL = "sqlite+aiosqlite:///./database.db"
 engine = create_async_engine(DATABASE_URL)
 SessionLocal = sessionmaker(
     engine, class_=AsyncSession, expire_on_commit=False

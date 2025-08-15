@@ -1,39 +1,67 @@
-import pandas as pd
-import numpy as np
-import pickle
-from pytorch_forecasting import TimeSeriesDataSet
-from pytorch_forecasting import TemporalFusionTransformer
-import os
-import requests_cache
-from retry_requests import retry
-import openmeteo_requests
+import logging
 import datetime
+import pickle
 import warnings
+from typing import Tuple, List
+
+import numpy as np
+import pandas as pd
 
 from scipy.interpolate import PchipInterpolator
 from statsmodels.tsa.seasonal import STL
 
+from pytorch_forecasting import TimeSeriesDataSet
+from pytorch_forecasting import TemporalFusionTransformer
+
+from config import OPEN_METEO_ARCHIVE_URL, OPEN_METEO_FORECAST_URL, MODEL_PATH, PARAMS_PATH, ENCODER_PATH
+
 warnings.filterwarnings('ignore')
 
+CONFIG_PATH = 'config.py'
 
-def process_task(lat, lng):
+# Используем логгирование
+logger = logging.getLogger("forecast_task")
+logging.basicConfig(level=logging.INFO)
+
+try:
+    model = TemporalFusionTransformer.load_from_checkpoint(MODEL_PATH)
+    with open(PARAMS_PATH, 'rb') as f:
+        params = pickle.load(f)
+    with open(ENCODER_PATH, 'rb') as f:
+        encoder = pickle.load(f)
+except Exception as e:
+    logger.exception("Failed to load config %s", CONFIG_PATH, e)
+    raise
+
+
+def _validate_lat_lng(lat: float, lng: float) -> None:
+    """Валидация координат"""
+    if not isinstance(lat, (float, int)) or not isinstance(lng, (float, int)):
+        raise ValueError("lat and lng must be numeric")
+    lat = float(lat)
+    lng = float(lng)
+    if not (-90.0 <= lat <= 90.0):
+        raise ValueError("lat out of bounds [-90,90]")
+    if not (-180.0 <= lng <= 180.0):
+        raise ValueError("lng out of bounds [-180,180]")
+
+
+def process_task(lat, lng) -> Tuple[List[float], List[datetime.datetime]]:
+    """Public entry point used by FastAPI background task"""
+    logger.info("Starting process_task for lat=%s lng=%s", lat, lng)
     try:
-        preds = get_prediction(data=get_data(lat, lng), dataset_path='dataset_parameters.pkl', model_path='model.ckpt')
-        return preds['temp'].tolist(), preds['time'].tolist()
-    except:
-        return 'error'
+        df = get_data(lat, lng)
+        preds_df = get_prediction(df)
+        logger.info("process_task succeeded for lat=%s lng=%s", lat, lng)
+        return preds_df['temp'].tolist(), preds_df['time'].tolist()
+    except Exception as e:
+        logger.exception("process_task failed for lat=%s lng=%s: %s", lat, lng, e)
+        raise
 
 
+# ПРИ ИЗМЕНЕНИИ АЛГОРИТМА ПРЕДСКАЗАНИЯ ИЛИ ЕГО ПАРАМЕТРОВ ПОДГОТОВКИ ДАННЫХ ДАННАЯ ФУНКЦИЯ ПЕРЕСТАЕТ РАБОТАТЬ ПРАВИЛЬНО
 def correct_adjustment(test_df, predicted_values, max_deviation=2, transition_points=None):
-    """
-    ИСПРАВЛЕННАЯ версия корректировки с использованием кубической интерполяции Эрмита.
-
-    Args:
-        true_value_at_minus1: Значение на -1 шаге
-        predicted_values: Массив предсказанных значений
-        max_deviation: Максимально допустимое отклонение от значения на -1 шаге
-        transition_points: Список точек для определения переходного участка
-    """
+    """Корректировка предсказаний с использованием кубической интерполяции Эрмита."""
     true_value_at_minus1 = test_df['temp'].iloc[-745]
     n = len(predicted_values)
 
@@ -77,150 +105,105 @@ def correct_adjustment(test_df, predicted_values, max_deviation=2, transition_po
     return adjusted_values, corrections
 
 
-def create_feature_interaction(df, feature1, feature2, operation='multiply'):
-    """
-    Создание взаимодействий между признаками
-
-    Parameters:
-    -----------
-    df : pd.DataFrame
-        Датафрейм с признаками
-    feature1 : str
-        Первый признак для взаимодействия
-    feature2 : str
-        Второй признак для взаимодействия
-    operation : str, default='multiply'
-        Операция взаимодействия: 'multiply', 'add', 'subtract', 'divide'
-
-    Returns:
-    --------
-    pd.DataFrame
-        Датафрейм с добавленным взаимодействием признаков
-    """
-    df_interaction = df.copy()
-
-    # Проверка наличия признаков
-    if feature1 not in df.columns or feature2 not in df.columns:
-        return df_interaction
-
-    # Создание взаимодействия
-    if operation == 'multiply':
-        df_interaction[f'{feature1}_x_{feature2}'] = df_interaction[feature1] * df_interaction[feature2]
-    elif operation == 'add':
-        df_interaction[f'{feature1}_+_{feature2}'] = df_interaction[feature1] + df_interaction[feature2]
-    elif operation == 'subtract':
-        df_interaction[f'{feature1}_-_{feature2}'] = df_interaction[feature1] - df_interaction[feature2]
-    elif operation == 'divide':
-        # Защита от деления на 0
-        df_interaction[f'{feature1}_/_{feature2}'] = df_interaction[feature1] / (df_interaction[feature2] + 1e-10)
-
-    return df_interaction
-
-
+# ПРИ ИЗМЕНЕНИИ АЛГОРИТМА ПРЕДСКАЗАНИЯ ИЛИ ЕГО ПАРАМЕТРОВ ПОДГОТОВКИ ДАННЫХ ДАННАЯ ФУНКЦИЯ ПЕРЕСТАЕТ РАБОТАТЬ ПРАВИЛЬНО
 def get_data(lat, lng):
+    _validate_lat_lng(lat, lng)
+
+    start_date = (datetime.datetime.utcnow() - datetime.timedelta(days=61)).strftime('%Y-%m-%d')
+    end_date = (datetime.datetime.utcnow() - datetime.timedelta(days=2)).strftime('%Y-%m-%d')
+
+    try:
+        import requests_cache
+        from retry_requests import retry
+        import openmeteo_requests
+    except Exception:
+        logger.exception("Missing optional dependencies for Open-Meteo client — ensure they're installed")
+        raise
+
     cache_session = requests_cache.CachedSession('.cache', expire_after=-1)
-    retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+    retry_session = retry(cache_session, retries=3, backoff_factor=0.2)
     openmeteo = openmeteo_requests.Client(session=retry_session)
 
-    start_date = (datetime.datetime.now() - datetime.timedelta(days=105)).strftime('%Y-%m-%d')
-    end_date = (datetime.datetime.utcnow() - datetime.timedelta(days=2)).strftime('%Y-%m-%d')
-    url = "https://archive-api.open-meteo.com/v1/archive"
-    params = {
-        "latitude": lat,
-        "longitude": lng,
-        "start_date": f"{start_date}",
-        "end_date": f"{end_date}",
+    params_archive = {
+        "latitude": float(lat),
+        "longitude": float(lng),
+        "start_date": start_date,
+        "end_date": end_date,
         "hourly": ["temperature_2m"],
-        "timezone": "GMT"
+        "timezone": "GMT",
     }
-    responses = openmeteo.weather_api(url, params=params)
 
-    hourly = responses[0].Hourly()
-    hourly_temperature_2m = hourly.Variables(0).ValuesAsNumpy()
+    try:
+        responses = openmeteo.weather_api(OPEN_METEO_ARCHIVE_URL, params=params_archive)
+        hourly = responses[0].Hourly()
+        hourly_temperature_2m = hourly.Variables(0).ValuesAsNumpy()
+    except Exception:
+        logger.exception("Failed to fetch archive data from Open-Meteo")
+        raise
 
-    hourly_data = {"time": pd.date_range(
-        start=pd.to_datetime(hourly.Time(), unit="s"),
-        end=pd.to_datetime(hourly.TimeEnd(), unit="s"),
-        freq=pd.Timedelta(seconds=hourly.Interval()),
-        inclusive="left"
-    ), "temp": hourly_temperature_2m}
-
+    hourly_data = {
+        "time": pd.date_range(
+            start=pd.to_datetime(hourly.Time(), unit="s"),
+            end=pd.to_datetime(hourly.TimeEnd(), unit="s"),
+            freq=pd.Timedelta(seconds=hourly.Interval()),
+            inclusive="left",
+        ),
+        "temp": hourly_temperature_2m,
+    }
     hourly_dataframe = pd.DataFrame(data=hourly_data)
-    hourly_dataframe = hourly_dataframe[
-        hourly_dataframe['time'] >= pd.to_datetime(datetime.datetime.utcnow() - datetime.timedelta(hours=2520))]
 
-    url1 = "https://api.open-meteo.com/v1/forecast"
-    params1 = {
-        "latitude": lat,
-        "longitude": lng,
+    params_forecast = {
+        "latitude": float(lat),
+        "longitude": float(lng),
         "hourly": "temperature_2m",
         "past_days": 1,
         "forecast_days": 1,
         "timezone": "GMT"
     }
-    responses1 = openmeteo.weather_api(url1, params=params1)
+    try:
+        responses1 = openmeteo.weather_api(OPEN_METEO_FORECAST_URL, params=params_forecast)
+        hourly1 = responses1[0].Hourly()
+        hourly_temperature_2m1 = hourly1.Variables(0).ValuesAsNumpy()
+    except Exception:
+        logger.exception("Failed to fetch forecast data from Open-Meteo")
+        raise
 
-    hourly1 = responses1[0].Hourly()
-    hourly_temperature_2m1 = hourly1.Variables(0).ValuesAsNumpy()
-
-    hourly_data1 = {"time": pd.date_range(
-        start=pd.to_datetime(hourly1.Time(), unit="s"),
-        end=pd.to_datetime(hourly1.TimeEnd(), unit="s"),
-        freq=pd.Timedelta(seconds=hourly1.Interval()),
-        inclusive="left"
-    ), "temp": hourly_temperature_2m1}
-
+    hourly_data1 = {
+        "time": pd.date_range(
+            start=pd.to_datetime(hourly1.Time(), unit="s"),
+            end=pd.to_datetime(hourly1.TimeEnd(), unit="s"),
+            freq=pd.Timedelta(seconds=hourly1.Interval()),
+            inclusive="left",
+        ),
+        "temp": hourly_temperature_2m1,
+    }
     hourly_dataframe1 = pd.DataFrame(data=hourly_data1)
-    hourly_dataframe1 = hourly_dataframe1[hourly_dataframe1['time'] <= pd.to_datetime(datetime.datetime.utcnow())]
 
-    data = pd.concat([hourly_dataframe, hourly_dataframe1])
-    data = data.reset_index()
-    data.drop(['index'], axis=1, inplace=True)
+    data = pd.concat([hourly_dataframe, hourly_dataframe1], ignore_index=True)
 
+    # Базовые признаки
     data['latitude'] = lat
     data['longitude'] = lng
-    data['station_id'] = 1
     data['time'] = pd.to_datetime(data['time'])
 
+    # Временные признаки
     data['hour'] = data['time'].dt.hour
-    data['day'] = data['time'].dt.day
     data['month'] = data['time'].dt.month
-    data['year'] = data['time'].dt.year
-    data['dayofweek'] = data['time'].dt.dayofweek
-    data['quarter'] = data['time'].dt.quarter
-    data['dayofyear'] = data['time'].dt.dayofyear
-    data['weekofyear'] = data['time'].dt.isocalendar().week
-
-    # День или ночь (приблизительно)
-    data['is_day'] = ((data['hour'] >= 6) & (data['hour'] <= 18)).astype(int)
-
-    # Выходной день или нет
-    data['is_weekend'] = (data['dayofweek'] >= 5).astype(int)
-
-    # Сезоны (северное полушарие): 0-зима, 1-весна, 2-лето, 3-осень
     data['season'] = (data['month'] % 12 // 3).astype(int)
 
-    # Циклические признаки для периодических переменных
+    # Циклические признаки
     data['hour_sin'] = np.sin(2 * np.pi * data['hour'] / 24)
     data['hour_cos'] = np.cos(2 * np.pi * data['hour'] / 24)
-
-    data['day_sin'] = np.sin(2 * np.pi * data['day'] / 31)
-    data['day_cos'] = np.cos(2 * np.pi * data['day'] / 31)
-
     data['month_sin'] = np.sin(2 * np.pi * data['month'] / 12)
     data['month_cos'] = np.cos(2 * np.pi * data['month'] / 12)
 
-    data['dayofweek_sin'] = np.sin(2 * np.pi * data['dayofweek'] / 7)
-    data['dayofweek_cos'] = np.cos(2 * np.pi * data['dayofweek'] / 7)
-
-    data['season_sin'] = np.sin(2 * np.pi * data['season'] / 4)
-    data['season_cos'] = np.cos(2 * np.pi * data['season'] / 4)
-
-    lags = [1, 2, 3, 6, 12, 24, 48, 72, 168, 336, 720, 1080]
+    # Лаги
+    lags = [1, 24]
     for lag in lags:
         data[f'temp_lag_{lag}'] = data['temp'].shift(lag)
 
-    windows = [3, 6, 12, 24, 48, 72, 168, 336, 720, 1080]
+    # Скользящее окно
+    windows = [168, 672]
     for window in windows:
         # Среднее
         data[f'temp_rolling_mean_{window}'] = data['temp'].rolling(window=window, min_periods=1).mean()
@@ -230,168 +213,81 @@ def get_data(lat, lng):
         data[f'temp_rolling_min_{window}'] = data['temp'].rolling(window=window, min_periods=1).min()
         # Максимум
         data[f'temp_rolling_max_{window}'] = data['temp'].rolling(window=window, min_periods=1).max()
-        # Размах
-        data[f'temp_rolling_range_{window}'] = (
-                data[f'temp_rolling_max_{window}'] - data[f'temp_rolling_min_{window}']
-        )
-        # Медиана
-        data[f'temp_rolling_median_{window}'] = data['temp'].rolling(window=window, min_periods=1).median()
-        # Экспоненциальное взвешенное среднее
-        data[f'temp_rolling_ewm_{window}'] = data['temp'].ewm(span=window, min_periods=1).mean()
 
-    diffs = [1, 2, 3, 6, 12, 24, 48, 72, 168, 336, 720, 1080]  # час, день, неделя, месяц
+    # Разница
+    diffs = [1, 24]
     for diff in diffs:
         data[f'temp_diff_{diff}'] = data['temp'].diff(diff)
         # Процентное изменение
         data[f'temp_pct_change_{diff}'] = data['temp'].pct_change(diff)
 
+    # STL-декомпозиция
     try:
-        # Более гибкий метод STL
-        stl = STL(data['time'], period=24, robust=True)
+        stl = STL(data['temp'].fillna(method='ffill'), period=24, robust=True)
         result = stl.fit()
 
-        data[f'time_trend'] = result.trend
-        data[f'time_seasonal'] = result.seasonal
-        data[f'time_residual'] = result.resid
-
-        stl1 = STL(data['time'], period=24, robust=True)
-        result = stl1.fit()
-        residual1 = result.resid
+        data[f'temp_trend'] = result.trend.reindex(data.index).fillna(method='ffill').fillna(0)
+        data[f'temp_seasonal'] = result.seasonal.reindex(data.index).fillna(0)
+        residual = result.resid
 
         # Определение порогов для аномалий
-        residual_mean = residual1.mean()
-        residual_std = residual1.std()
-        lower_threshold = residual_mean - 2 * residual_std
-        upper_threshold = residual_mean + 2 * residual_std
-
-        # Маркировка аномалий
-        data[f'temp_is_anomaly'] = (
-                (residual1 < lower_threshold) | (residual1 > upper_threshold)
-        ).astype(int)
+        residual_mean = residual.mean()
+        residual_std = residual.std()
 
         # Добавление абсолютного значения отклонения (для ранжирования аномалий)
-        data[f'temp_anomaly_score'] = np.abs((residual1 - residual_mean) / residual_std)
+        data[f'temp_anomaly_score'] = np.abs((residual - residual_mean) / (residual_std + 1e-10))
 
     except:
-        # Если разложение не получается, заполняем нулями
-        data[f'data_trend'] = 0
-        data[f'data_seasonal'] = 0
-        data[f'data_residual'] = 0
-        data[f'temp_is_anomaly'] = 0
+        data[f'temp_trend'] = 0
+        data[f'temp_seasonal'] = 0
         data[f'temp_anomaly_score'] = 0
 
-    periods = [24, 72, 168, 720]  # день, неделя, 30 дней
-    harmonics = 3
+    data['time_idx'] = range(0, len(data))
 
-    # Получаем временной индекс как числовую последовательность
-    time_idx = np.arange(start=134736, stop=134736 + len(data))
-    data['time_idx'] = time_idx
-
-    # Создание признаков Фурье
-    for period in periods:
-        for harmonic in range(1, harmonics + 1):
-            # Синус
-            data[f'temp_fourier_sin_{period}_{harmonic}'] = np.sin(2 * np.pi * harmonic * data['temp'] / period)
-            # Косинус
-            data[f'temp_fourier_cos_{period}_{harmonic}'] = np.cos(2 * np.pi * harmonic * data['temp'] / period)
-
-    # Создание взаимодействий признаков
-    target_col = 'temp'
-    if 'temperature_trend' in data.columns:
-        data = create_feature_interaction(data, target_col, 'temperature_trend', operation='subtract')
-
-    # Взаимодействие между сезонными признаками и температурой
-    if 'month_sin' in data.columns:
-        data = create_feature_interaction(data, target_col, 'month_sin', operation='multiply')
-
-    if 'hour_sin' in data.columns:
-        data = create_feature_interaction(data, target_col, 'hour_sin', operation='multiply')
-
-    # Вычисление дополнительных статистик
-    if f'{target_col}_rolling_mean_24' in data.columns and f'{target_col}_rolling_std_24' in data.columns:
-        # Коэффициент вариации (отношение стандартного отклонения к среднему)
-        data[f'{target_col}_cv_24'] = data[f'{target_col}_rolling_std_24'] / (
-                data[f'{target_col}_rolling_mean_24'] + 1e-10)
-
-    if f'{target_col}_rolling_max_24' in data.columns and f'{target_col}_rolling_min_24' in data.columns:
-        # Нормализованный размах
-        data[f'{target_col}_norm_range_24'] = (data[f'{target_col}_rolling_max_24'] - data[
-            f'{target_col}_rolling_min_24']) / (data[f'{target_col}_rolling_mean_24'] + 1e-10)
-
-    # Добавление флага аномально высокой или низкой температуры
-    if f'{target_col}_is_anomaly' in data.columns:
-        # Получаем статистики для сезонов
-        if 'season' in data.columns:
-            season_stats = data.groupby('season')[target_col].agg(['mean', 'std'])
-
-            # Создаем новые признаки
-            for season in data['season'].unique():
-                season_mean = season_stats.loc[season, 'mean']
-                season_std = season_stats.loc[season, 'std']
-
-                mask = data['season'] == season
-                data.loc[mask, f'{target_col}_season_zscore'] = (data.loc[mask, target_col] - season_mean) / (
-                        season_std + 1e-10)
     data.dropna(inplace=True)
 
+    # Формирование данных на горизонт предсказаний
     last_index = data['time_idx'].max()
-
     new_df = pd.DataFrame(
         {'time': pd.date_range(start=pd.to_datetime(data['time'].iloc[-1]) + datetime.timedelta(hours=1),
-                               periods=744, freq='H')})
-
+                               periods=672, freq='H')})
     new_df['hour'] = new_df['time'].dt.hour
-    new_df['day'] = new_df['time'].dt.day
     new_df['month'] = new_df['time'].dt.month
-    new_df['dayofweek'] = new_df['time'].dt.dayofweek
     new_df['season'] = (new_df['month'] % 12 // 3).astype(int)
 
     new_df['hour_sin'] = np.sin(2 * np.pi * new_df['hour'] / 24)
     new_df['hour_cos'] = np.cos(2 * np.pi * new_df['hour'] / 24)
-
-    new_df['day_sin'] = np.sin(2 * np.pi * new_df['day'] / 31)
-    new_df['day_cos'] = np.cos(2 * np.pi * new_df['day'] / 31)
-
     new_df['month_sin'] = np.sin(2 * np.pi * new_df['month'] / 12)
     new_df['month_cos'] = np.cos(2 * np.pi * new_df['month'] / 12)
 
-    new_df['dayofweek_sin'] = np.sin(2 * np.pi * new_df['dayofweek'] / 7)
-    new_df['dayofweek_cos'] = np.cos(2 * np.pi * new_df['dayofweek'] / 7)
-
-    new_df['season_sin'] = np.sin(2 * np.pi * new_df['season'] / 4)
-    new_df['season_cos'] = np.cos(2 * np.pi * new_df['season'] / 4)
-
     new_df['time_idx'] = range(last_index + 1, last_index + 1 + len(new_df))
-
     new_df.fillna(0, inplace=True)
 
-    df = pd.concat([data, new_df])
-
-    df.fillna(0, inplace=True)
-
-    df['station_id'] = 0
-
-    df.reset_index(inplace=True)
-    df.drop(['index'], axis=1, inplace=True)
+    df = pd.concat([data, new_df], ignore_index=True)
+    df['station_id'] = 999
+    df.reset_index(drop=True, inplace=True)
 
     return df
 
 
-def get_prediction(data, dataset_path, model_path):
-    if os.path.exists(dataset_path) and os.path.exists(model_path):
+# ПРИ ИЗМЕНЕНИИ АЛГОРИТМА ПРЕДСКАЗАНИЯ ИЛИ ЕГО ПАРАМЕТРОВ ПОДГОТОВКИ ДАННЫХ ДАННАЯ ФУНКЦИЯ ПЕРЕСТАЕТ РАБОТАТЬ ПРАВИЛЬНО
+def get_prediction(data):
+    """Подготовка набора данных, запуск модели. Возвращает прогнозируемый фрейм данных"""
 
-        with open(dataset_path, 'rb') as file:
-            datas = pickle.load(file)
+    # Создание TimeSeriesDataSet
+    try:
+        dataset = TimeSeriesDataSet.from_parameters(parameters=params, data=data, predict=True, stop_randomization=True, categorical_encoders={"series": encoder})
+    except Exception:
+        logger.exception("Failed to construct TimeSeriesDataSet")
+        raise
 
-        model = TemporalFusionTransformer.load_from_checkpoint(model_path)
-
-    else:
-        raise FileNotFoundError
-
-    dataset = TimeSeriesDataSet.from_parameters(parameters=datas, data=data, predict=True, stop_randomization=True)
     dataloader = dataset.to_dataloader(train=False, batch_size=128, num_workers=0)
 
-    preds = model.predict(dataloader)
+    try:
+        preds = model.predict(dataloader)
+    except Exception:
+        logger.exception("Model prediction failed")
+        raise
 
     point_predictions = preds.cpu().numpy().squeeze()
 
@@ -399,6 +295,6 @@ def get_prediction(data, dataset_path, model_path):
 
     dates = data.iloc[-744:]['time'].values
     predicted_data = pd.DataFrame({'time': dates, 'temp': predicted_values})
-    predicted_data = pd.concat([data[['time', 'temp']].iloc[-745:-744], predicted_data.iloc[:672]])
+    predicted_data = pd.concat([data[['time', 'temp']].iloc[-745:-744], predicted_data.iloc[:672]], ignore_index=True)
     predicted_data['time'] = pd.to_datetime(predicted_data['time'])
     return predicted_data
