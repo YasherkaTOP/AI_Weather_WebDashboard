@@ -1,4 +1,6 @@
-# Feyra WeatherAi WebDashboard (alpha 0.2, python 3.9)
+# ![Deprecated](https://img.shields.io/badge/Status-Deprecated-red)  Feyra WeatherAi WebDashboard (alpha 0.2, python 3.9) 
+## ⚠️ Deprecation Notice  
+This repository is no longer actively maintained. The functionality has been commercialized.
 ## Описание
 Feyra WeatherAi WebDashboard — это веб-дашборд для управления виртуальными метеостанциями. Система предназначена для визуализации данных, предсказания температуры на 28 дней с почасовой детализацией, анализа температурных трендов и оповещения о критических изменениях температуры. Имеет клиент-серверную архитектуру (FastAPI + Flet).
 
